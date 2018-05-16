@@ -38,7 +38,7 @@
 #    POSSIBILITY OF SUCH DAMAGE.                                           #
 ############################################################################
 
-from __future__ import with_statement
+from __future__ import with_statement, division
 
 import rospy
 
@@ -52,8 +52,10 @@ import string
 import multiprocessing
 
 import socket
+import re
 
 from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus, KeyValue
+from std_msgs.msg import Float32
 
 cpu_load_warn = 0.9
 cpu_load_error = 1.1
@@ -93,6 +95,8 @@ def update_status_stale(stat, last_update_time):
 class CPUMonitor():
     def __init__(self, hostname, diag_hostname):
         self._diag_pub = rospy.Publisher('/diagnostics', DiagnosticArray, queue_size = 100)
+        self._avg_temp_pub = rospy.Publisher('/device_supervisors/rpi/temperature', Float32, queue_size = 100)
+        self._avg_cpu_pub = rospy.Publisher('/device_supervisors/rpi/cpu_pct', Float32, queue_size = 100)
 
         self._mutex = threading.Lock()
 
@@ -109,7 +113,7 @@ class CPUMonitor():
 
         self._temps_timer = None
         self._usage_timer = None
-        
+
         # Get temp_input files
         self._temp_vals = self.get_core_temp_names()
 
@@ -142,18 +146,18 @@ class CPUMonitor():
         self.check_temps()
         self.check_usage()
 
-    # Restart temperature checking 
+    # Restart temperature checking
     def _restart_temp_check(self):
         rospy.logerr('Restarting temperature check thread in cpu_monitor. This should not happen')
         try:
             with self._mutex:
                 if self._temps_timer:
                     self._temps_timer.cancel()
-                
+
             self.check_temps()
         except Exception, e:
             rospy.logerr('Unable to restart temp thread. Error: %s' % traceback.format_exc())
-            
+
 
     ## Must have the lock to cancel everything
     def cancel_timers(self):
@@ -429,11 +433,11 @@ class CPUMonitor():
 
         with self._mutex:
             self._last_temp_time = rospy.get_time()
-            
+
             self._temp_stat.level = diag_level
             self._temp_stat.message = message
             self._temp_stat.values = diag_vals
-            
+
             if not rospy.is_shutdown():
                 self._temps_timer = threading.Timer(5.0, self.check_temps)
                 self._temps_timer.start()
@@ -444,7 +448,7 @@ class CPUMonitor():
         if rospy.is_shutdown():
             with self._mutex:
                 self.cancel_timers()
-            return 
+            return
 
         diag_level = 0
         diag_vals = [ KeyValue(key = 'Update Status', value = 'OK' ),
@@ -463,14 +467,14 @@ class CPUMonitor():
         if mp_level > 0:
             diag_msgs.append(mp_msg)
         diag_level = max(diag_level, mp_level)
-            
+
         # Check uptime
         uptime_level, up_msg, up_vals = self.check_uptime()
         diag_vals.extend(up_vals)
         if uptime_level > 0:
             diag_msgs.append(up_msg)
         diag_level = max(diag_level, uptime_level)
-        
+
         if diag_msgs and diag_level > 0:
             usage_msg = ', '.join(set(diag_msgs))
         else:
@@ -481,9 +485,9 @@ class CPUMonitor():
             self._last_usage_time = rospy.get_time()
             self._usage_stat.level = diag_level
             self._usage_stat.values = diag_vals
-            
+
             self._usage_stat.message = usage_msg
-            
+
             if not rospy.is_shutdown():
                 self._usage_timer = threading.Timer(5.0, self.check_usage)
                 self._usage_timer.start()
@@ -505,12 +509,46 @@ class CPUMonitor():
                 self._diag_pub.publish(msg)
                 self._last_publish_time = rospy.get_time()
 
-        
+        msg = Float32()
+        msg.data = self.get_average_temperature()
+        self._avg_temp_pub.publish(msg)
+
+        msg = Float32()
+        msg.data = self.get_average_cpu_load()
+        self._avg_cpu_pub.publish(msg)
+
+
         # Restart temperature checking if it goes stale, #4171
         # Need to run this without mutex
-        if rospy.get_time() - self._last_temp_time > 90: 
+        if rospy.get_time() - self._last_temp_time > 90:
             self._restart_temp_check()
 
+    def get_average_temperature(self):
+        avg_temperature = 0.0
+        core_count = 0
+        for kv in self._temp_stat.values:
+            key = kv.key
+            value = kv.value
+            if "Core" in key:
+                core_count += 1
+                s = re.findall("\d+\.\d+", value)
+                avg_temperature += float(s[0])
+
+        return avg_temperature / core_count
+
+    def get_average_cpu_load(self):
+        idle_sum = 0.0
+        core_count = 0
+        for kv in self._usage_stat.values:
+            key = kv.key
+            value = kv.value
+            if "Idle" in key:
+                core_count += 1
+                s = re.findall("\d+\.\d+", value)
+                idle_sum += float(s[0])
+
+        load_avg = 1 - (idle_sum / (100 * core_count))
+        return load_avg
 
 if __name__ == '__main__':
     hostname = socket.gethostname()
